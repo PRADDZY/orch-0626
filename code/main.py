@@ -15,8 +15,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="output.csv", help="Output CSV path relative to repo root.")
     parser.add_argument(
         "--strategy",
-        choices=["hybrid", "retrieval", "text_baseline"],
-        default="retrieval",
+        choices=["ensemble", "hybrid", "retrieval", "text_baseline"],
+        default="ensemble",
         help="Prediction strategy to run.",
     )
     return parser
@@ -31,8 +31,8 @@ def main() -> int:
     input_path = repo_root / args.input
     output_path = repo_root / args.output
     rows = read_csv_rows(input_path)
-    strategy = "hybrid" if args.strategy == "hybrid" else args.strategy
-    if strategy == "hybrid" and not config.enable_live_models:
+    strategy = args.strategy
+    if strategy in {"ensemble", "hybrid"} and not config.enable_live_models:
         strategy = "retrieval"
     predictions = reviewer.predict_rows(rows, strategy=strategy)
     write_csv_rows(output_path, [prediction.values for prediction in predictions])

@@ -1,0 +1,12 @@
+{
+  "observed_object_type": "laptop",
+  "visible_issue_type": "broken_part",
+  "visible_object_part": "hinge",
+  "evidence_sufficient": true,
+  "claimed_part_visible": true,
+  "claim_status": "supported",
+  "severity": "high",
+  "risk_flags": [],
+  "justification": "The image clearly shows a laptop with a severely broken hinge area, where the plastic casing is shattered and separated, supporting the claim of a broken hinge.",
+  "confidence": 1.0
+}

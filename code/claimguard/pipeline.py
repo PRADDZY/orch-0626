@@ -452,6 +452,212 @@ class ClaimReviewer:
         general_rules = [item["minimum_image_evidence"] for item in self.requirements_rows if item["claim_object"] == "all"]
         return list(dict.fromkeys(general_rules + rows))
 
+    def _split_semicolon_value(self, value: str) -> list[str]:
+        return [item.strip() for item in value.split(";") if item.strip() and item.strip() != "none"]
+
+    def _prediction_flags(self, prediction: Prediction) -> set[str]:
+        return set(self._split_semicolon_value(prediction.values["risk_flags"]))
+
+    def _prediction_supporting_ids(self, prediction: Prediction) -> list[str]:
+        return self._split_semicolon_value(prediction.values["supporting_image_ids"])
+
+    def _is_clean_live_decision(self, prediction: Prediction) -> bool:
+        flags = self._prediction_flags(prediction)
+        if prediction.values["claim_status"] not in {"supported", "contradicted"}:
+            return False
+        if prediction.values["evidence_standard_met"] != "true":
+            return False
+        if prediction.values["valid_image"] != "true":
+            return False
+        blocking_flags = {
+            "wrong_object",
+            "claim_mismatch",
+            "damage_not_visible",
+            "possible_manipulation",
+            "non_original_image",
+            "text_instruction_present",
+            "manual_review_required",
+        }
+        return not flags.intersection(blocking_flags)
+
+    def _choose_ensemble_prediction(self, retrieval_prediction: Prediction, hybrid_prediction: Prediction) -> Prediction:
+        retrieval_values = retrieval_prediction.values
+        hybrid_values = hybrid_prediction.values
+        retrieval_flags = self._prediction_flags(retrieval_prediction)
+        hybrid_flags = self._prediction_flags(hybrid_prediction)
+
+        same_core_decision = all(
+            retrieval_values[field] == hybrid_values[field]
+            for field in ("claim_status", "issue_type", "object_part", "severity", "valid_image", "evidence_standard_met")
+        )
+        if same_core_decision:
+            if hybrid_flags < retrieval_flags:
+                return hybrid_prediction
+            retrieval_support = self._prediction_supporting_ids(retrieval_prediction)
+            hybrid_support = self._prediction_supporting_ids(hybrid_prediction)
+            if hybrid_flags == retrieval_flags and hybrid_support and len(hybrid_support) == 1 and len(retrieval_support) > 1:
+                return hybrid_prediction
+
+        if retrieval_values["claim_status"] == "not_enough_information" and self._is_clean_live_decision(hybrid_prediction):
+            return hybrid_prediction
+
+        return retrieval_prediction
+
+    def _aggregate_live_reviews_fallback(
+        self,
+        row: dict[str, str],
+        parsed: ParsedClaim,
+        qcs: list[ImageQC],
+        reviews: list[ImageReview],
+    ) -> Prediction | None:
+        has_live_signal = any(
+            review.evidence_sufficient
+            or review.claim_status != "not_enough_information"
+            or review.visible_issue_type != "unknown"
+            or review.confidence > 0.35
+            or review.risk_flags
+            for review in reviews
+        )
+        if not has_live_signal:
+            return None
+
+        history_flags = self._history_risk_flags(row["user_id"])
+        supported = [
+            review
+            for review in reviews
+            if review.claim_status == "supported" and (review.evidence_sufficient or review.visible_issue_type != "unknown")
+        ]
+        contradicted = [
+            review
+            for review in reviews
+            if review.claim_status == "contradicted" and (review.evidence_sufficient or review.visible_issue_type != "unknown")
+        ]
+        insufficient = [review for review in reviews if review.claim_status == "not_enough_information"]
+
+        if supported:
+            chosen = max(supported, key=lambda review: (review.evidence_sufficient, review.claimed_part_visible, review.confidence))
+        elif contradicted:
+            chosen = max(contradicted, key=lambda review: (review.evidence_sufficient, review.confidence))
+        elif insufficient:
+            chosen = max(insufficient, key=lambda review: review.confidence)
+        else:
+            return None
+
+        claim_status = chosen.claim_status
+        issue_type = chosen.visible_issue_type if chosen.visible_issue_type != "unknown" else parsed.issue_type
+        object_part = chosen.visible_object_part if chosen.visible_object_part != "unknown" else parsed.object_part
+        risk_flags: list[str] = []
+        for qc in qcs:
+            for flag in qc.risk_flags:
+                if flag not in risk_flags:
+                    risk_flags.append(flag)
+        for review in reviews:
+            for flag in review.risk_flags:
+                if flag not in risk_flags:
+                    risk_flags.append(flag)
+        for flag in history_flags:
+            if flag not in risk_flags:
+                risk_flags.append(flag)
+        if parsed.prompt_injection_detected and "text_instruction_present" not in risk_flags:
+            risk_flags.append("text_instruction_present")
+
+        corroborated_non_original = (
+            sum(1 for review in reviews if "non_original_image" in review.risk_flags) >= 2
+            or any(
+                "non_original_image" in review.risk_flags
+                and any(flag in review.risk_flags for flag in {"possible_manipulation", "text_instruction_present"})
+                for review in reviews
+            )
+        )
+        if claim_status == "supported" and not contradicted and not corroborated_non_original:
+            risk_flags = [flag for flag in risk_flags if flag not in {"non_original_image", "claim_mismatch"}]
+        if claim_status != "not_enough_information":
+            risk_flags = [flag for flag in risk_flags if flag != "damage_not_visible"]
+        elif not any(review.claimed_part_visible for review in reviews) and "damage_not_visible" not in risk_flags:
+            risk_flags.append("damage_not_visible")
+
+        if claim_status == "supported" and any(
+            flag in risk_flags for flag in {"wrong_object", "claim_mismatch", "possible_manipulation", "text_instruction_present"}
+        ):
+            claim_status = "not_enough_information"
+        if claim_status == "supported" and "non_original_image" in risk_flags and corroborated_non_original:
+            claim_status = "not_enough_information"
+
+        evidence_standard_met = (
+            claim_status != "not_enough_information"
+            and any(review.evidence_sufficient for review in reviews if review.claim_status == chosen.claim_status)
+            and any(qc.usable for qc in qcs)
+        )
+        valid_image = any(qc.usable for qc in qcs)
+        if any(flag in risk_flags for flag in {"possible_manipulation", "text_instruction_present"}):
+            valid_image = False
+        elif "non_original_image" in risk_flags and corroborated_non_original and claim_status != "supported":
+            valid_image = False
+
+        manual_review_required = False
+        if any(flag in risk_flags for flag in {"wrong_object", "possible_manipulation", "text_instruction_present"}):
+            manual_review_required = True
+        if "claim_mismatch" in risk_flags and claim_status != "supported":
+            manual_review_required = True
+        if "non_original_image" in risk_flags and corroborated_non_original:
+            manual_review_required = True
+        if "user_history_risk" in risk_flags:
+            manual_review_required = True
+        if supported and contradicted:
+            manual_review_required = True
+        if manual_review_required and "manual_review_required" not in risk_flags:
+            risk_flags.append("manual_review_required")
+        if not manual_review_required:
+            risk_flags = [flag for flag in risk_flags if flag != "manual_review_required"]
+
+        issue_type = issue_type if issue_type in ISSUE_TYPES else "unknown"
+        object_part = object_part if object_part in OBJECT_PARTS[row["claim_object"]] else "unknown"
+        severity = choose_severity(issue_type)
+        if claim_status == "contradicted" and issue_type == "none":
+            severity = "none"
+        if claim_status == "not_enough_information":
+            severity = "unknown"
+
+        supporting_image_ids = "none"
+        if claim_status != "not_enough_information":
+            supporting_image_ids = chosen.image_id if chosen.image_id != "none" else "none"
+
+        if evidence_standard_met:
+            evidence_reason = (
+                f"The claimed {object_part.replace('_', ' ')} is visible clearly enough in the submitted image set to evaluate the claim."
+            )
+        else:
+            evidence_reason = (
+                f"The submitted images do not show the claimed {parsed.object_part.replace('_', ' ')} clearly enough for a reliable decision."
+                if parsed.object_part != "unknown"
+                else "The submitted images do not provide enough clear evidence to evaluate the claim."
+            )
+
+        if claim_status == "supported":
+            status_justification = f"{chosen.justification} Supporting images: {supporting_image_ids}."
+        elif claim_status == "contradicted":
+            status_justification = f"{chosen.justification} The available images support a contradiction rather than the stated claim."
+        else:
+            status_justification = f"{chosen.justification} The image set is not strong enough for a definitive confirmation or contradiction."
+
+        values = {
+            "user_id": row["user_id"],
+            "image_paths": row["image_paths"],
+            "user_claim": row["user_claim"],
+            "claim_object": row["claim_object"],
+            "evidence_standard_met": to_bool_text(evidence_standard_met),
+            "evidence_standard_met_reason": normalize_spaces(evidence_reason),
+            "risk_flags": ";".join(flag for flag in RISK_FLAG_ORDER if flag in risk_flags) if risk_flags else "none",
+            "issue_type": issue_type,
+            "object_part": object_part,
+            "claim_status": claim_status,
+            "claim_status_justification": normalize_spaces(status_justification),
+            "supporting_image_ids": supporting_image_ids,
+            "valid_image": to_bool_text(valid_image),
+            "severity": severity,
+        }
+        return Prediction(row=row, values=values)
+
     def _provider_normalize_claim(self, row: dict[str, str], parsed: ParsedClaim) -> ParsedClaim:
         if not self.providers:
             return parsed
@@ -480,7 +686,11 @@ class ClaimReviewer:
         object_part = payload.get("object_part", parsed.object_part)
         if object_part not in OBJECT_PARTS[row["claim_object"]]:
             object_part = parsed.object_part
-        claimed_parts = [part for part in payload.get("claimed_parts", parsed.claimed_parts) if part in OBJECT_PARTS[row["claim_object"]]]
+        claimed_parts = [
+            part
+            for part in coerce_list(payload.get("claimed_parts", parsed.claimed_parts))
+            if part in OBJECT_PARTS[row["claim_object"]]
+        ]
         return ParsedClaim(
             claim_summary=normalize_spaces(payload.get("claim_summary", parsed.claim_summary)),
             issue_type=issue_type,
@@ -636,6 +846,7 @@ class ClaimReviewer:
             row["claim_object"],
             fallback=parsed.object_part,
         )
+        history_flags = self._history_risk_flags(row["user_id"])
         risk_flags = [
             flag
             for flag in coerce_list(payload.get("risk_flags", []))
@@ -648,40 +859,116 @@ class ClaimReviewer:
                 risk_flags.append("blurry_image")
             if (qc.brightness < 24 or qc.bright_fraction > 0.4) and "low_light_or_glare" not in risk_flags:
                 risk_flags.append("low_light_or_glare")
-        for flag in self._history_risk_flags(row["user_id"]):
+        for flag in history_flags:
             if flag not in risk_flags:
                 risk_flags.append(flag)
         if parsed.prompt_injection_detected and "text_instruction_present" not in risk_flags:
             risk_flags.append("text_instruction_present")
 
+        supported_reviews = [review for review in reviews if review.claim_status == "supported"]
+        contradicted_reviews = [review for review in reviews if review.claim_status == "contradicted"]
+        strong_supported_reviews = [
+            review
+            for review in supported_reviews
+            if review.evidence_sufficient and review.visible_issue_type != "unknown" and review.visible_object_part != "unknown"
+        ]
+        strong_contradicted_reviews = [
+            review
+            for review in contradicted_reviews
+            if review.evidence_sufficient or review.visible_issue_type != "unknown" or review.visible_object_part != "unknown"
+        ]
+        corroborated_non_original = (
+            sum(1 for review in reviews if "non_original_image" in review.risk_flags) >= 2
+            or any(
+                "non_original_image" in review.risk_flags
+                and any(flag in review.risk_flags for flag in {"possible_manipulation", "text_instruction_present"})
+                for review in reviews
+            )
+        )
+        if strong_supported_reviews and not contradicted_reviews and not corroborated_non_original:
+            risk_flags = [flag for flag in risk_flags if flag != "non_original_image"]
+        if strong_supported_reviews and any(review.claimed_part_visible for review in strong_supported_reviews):
+            risk_flags = [flag for flag in risk_flags if flag != "damage_not_visible"]
+        if strong_supported_reviews and not contradicted_reviews:
+            risk_flags = [flag for flag in risk_flags if flag != "claim_mismatch"]
+
         claim_status = normalize_claim_status_value(str(payload.get("claim_status", "not_enough_information")))
+        if claim_status == "not_enough_information" and strong_supported_reviews and not any(
+            flag in risk_flags
+            for flag in {"wrong_object", "claim_mismatch", "possible_manipulation", "text_instruction_present", "non_original_image"}
+        ):
+            claim_status = "supported"
         if claim_status == "supported" and any(
-            flag in risk_flags for flag in {"wrong_object", "claim_mismatch", "non_original_image", "possible_manipulation"}
+            flag in risk_flags for flag in {"wrong_object", "claim_mismatch", "possible_manipulation", "text_instruction_present"}
         ):
             claim_status = "not_enough_information"
-        if claim_status == "supported" and issue_type == "unknown":
+        if claim_status == "supported" and "non_original_image" in risk_flags and corroborated_non_original:
             claim_status = "not_enough_information"
+        if claim_status == "supported" and issue_type == "unknown":
+            if strong_supported_reviews:
+                issue_type = strong_supported_reviews[0].visible_issue_type
+                object_part = strong_supported_reviews[0].visible_object_part
+            if issue_type == "unknown":
+                claim_status = "not_enough_information"
         evidence_standard_met = coerce_bool(payload.get("evidence_standard_met"), default=claim_status != "not_enough_information")
+        if claim_status == "supported" and strong_supported_reviews:
+            evidence_standard_met = True
+        if claim_status == "contradicted" and strong_contradicted_reviews:
+            evidence_standard_met = True
         if claim_status == "not_enough_information" or not any(qc.usable for qc in qcs):
             evidence_standard_met = False
 
         valid_image = coerce_bool(payload.get("valid_image"), default=any(qc.usable for qc in qcs))
-        if any(flag in risk_flags for flag in {"non_original_image", "possible_manipulation"}) or not any(qc.usable for qc in qcs):
+        if not any(qc.usable for qc in qcs):
             valid_image = False
+        elif any(flag in risk_flags for flag in {"possible_manipulation", "text_instruction_present"}):
+            valid_image = False
+        elif "non_original_image" in risk_flags and corroborated_non_original and not strong_supported_reviews:
+            valid_image = False
+        elif strong_supported_reviews and not corroborated_non_original:
+            valid_image = True
 
-        if claim_status == "not_enough_information" and "damage_not_visible" not in risk_flags:
-            risk_flags.append("damage_not_visible")
-        if any(flag in risk_flags for flag in {"wrong_object", "claim_mismatch", "possible_manipulation", "non_original_image", "text_instruction_present"}):
-            if "manual_review_required" not in risk_flags:
-                risk_flags.append("manual_review_required")
-        if "user_history_risk" in risk_flags and "manual_review_required" not in risk_flags:
+        if claim_status == "not_enough_information":
+            if not any(review.claimed_part_visible for review in reviews) and "damage_not_visible" not in risk_flags:
+                risk_flags.append("damage_not_visible")
+        else:
+            risk_flags = [flag for flag in risk_flags if flag != "damage_not_visible"]
+
+        manual_review_required = False
+        if any(flag in risk_flags for flag in {"wrong_object", "possible_manipulation", "text_instruction_present"}):
+            manual_review_required = True
+        if "claim_mismatch" in risk_flags and claim_status != "supported":
+            manual_review_required = True
+        if "non_original_image" in risk_flags and corroborated_non_original:
+            manual_review_required = True
+        if "user_history_risk" in risk_flags:
+            manual_review_required = True
+        if strong_supported_reviews and contradicted_reviews:
+            manual_review_required = True
+        if parsed.mentions_multiple_parts and claim_status == "not_enough_information" and not strong_supported_reviews:
+            manual_review_required = True
+        if manual_review_required and "manual_review_required" not in risk_flags:
             risk_flags.append("manual_review_required")
+        if not manual_review_required:
+            risk_flags = [flag for flag in risk_flags if flag != "manual_review_required"]
 
         supporting_ids = [
             image_id
             for image_id in coerce_list(payload.get("supporting_image_ids", []))
             if any(qc.image_id == image_id for qc in qcs)
         ]
+        if claim_status == "supported" and strong_supported_reviews:
+            strong_ids = {review.image_id for review in strong_supported_reviews}
+            supporting_ids = [image_id for image_id in supporting_ids if image_id in strong_ids]
+            if not supporting_ids:
+                best_review = max(strong_supported_reviews, key=lambda review: (review.confidence, review.claimed_part_visible))
+                supporting_ids = [best_review.image_id]
+        elif claim_status == "contradicted" and strong_contradicted_reviews:
+            strong_ids = {review.image_id for review in strong_contradicted_reviews}
+            supporting_ids = [image_id for image_id in supporting_ids if image_id in strong_ids]
+            if not supporting_ids:
+                best_review = max(strong_contradicted_reviews, key=lambda review: (review.confidence, review.evidence_sufficient))
+                supporting_ids = [best_review.image_id]
         if claim_status != "not_enough_information" and not supporting_ids and qcs:
             supporting_ids = [qcs[0].image_id]
         supporting_ids = list(dict.fromkeys(supporting_ids))
@@ -949,6 +1236,7 @@ class ClaimReviewer:
             qc = analyze_image_qc(image_path, image_id_from_path(relative_path))
             qcs.append(qc)
         self.runtime_stats.images_processed += len(qcs)
+        live_parsed = self._provider_normalize_claim(row, parsed) if self.providers and strategy in {"hybrid", "ensemble"} else parsed
 
         if strategy == "text_baseline":
             reviews = [
@@ -967,10 +1255,27 @@ class ClaimReviewer:
                 for qc in qcs
             ]
         elif strategy == "hybrid" and self.providers:
-            reviews = [self._provider_review_image(row, parsed, qc) for qc in qcs]
-            prediction = self._provider_predict_row(row, parsed, qcs, reviews)
+            reviews = [self._provider_review_image(row, live_parsed, qc) for qc in qcs]
+            prediction = self._provider_predict_row(row, live_parsed, qcs, reviews)
             if prediction is not None:
                 return prediction
+            prediction = self._aggregate_live_reviews_fallback(row, live_parsed, qcs, reviews)
+            if prediction is not None:
+                return prediction
+            reviews = self._fallback_review(row, parsed, qcs)
+        elif strategy == "ensemble":
+            retrieval_prediction = self._aggregate_prediction(row, parsed, qcs, self._fallback_review(row, parsed, qcs))
+            if not self.providers:
+                return retrieval_prediction
+            reviews = [self._provider_review_image(row, live_parsed, qc) for qc in qcs]
+            prediction = self._provider_predict_row(row, live_parsed, qcs, reviews)
+            if prediction is None:
+                prediction = self._aggregate_live_reviews_fallback(row, live_parsed, qcs, reviews)
+            if prediction is None:
+                return retrieval_prediction
+            return self._choose_ensemble_prediction(retrieval_prediction, prediction)
+        elif strategy == "hybrid":
+            reviews = self._fallback_review(row, parsed, qcs)
         else:
             reviews = self._fallback_review(row, parsed, qcs)
         return self._aggregate_prediction(row, parsed, qcs, reviews)
@@ -1017,24 +1322,37 @@ def evaluate_predictions(
     )
 
 
-def build_operational_notes(reviewer: ClaimReviewer, total_rows: int, avg_images_per_row: float) -> dict[str, Any]:
-    live_path = reviewer.config.enable_live_models
+def build_operational_notes(
+    reviewer: ClaimReviewer,
+    total_rows: int,
+    avg_images_per_row: float,
+    strategy_name: str = "retrieval",
+) -> dict[str, Any]:
+    live_path = strategy_name in {"hybrid", "ensemble"} and reviewer.config.enable_live_models and reviewer.runtime_stats.provider_calls > 0
     if live_path:
         model_calls = reviewer.runtime_stats.provider_calls or total_rows
         token_in = reviewer.runtime_stats.input_tokens_estimate or model_calls * 900
         token_out = reviewer.runtime_stats.output_tokens_estimate or model_calls * 250
         cost_assumption = "NVIDIA Build developer endpoint assumed to be free during hackathon development; OpenRouter fallback cost not incurred unless explicitly enabled."
+        if strategy_name == "ensemble":
+            latency_note = (
+                "Ensemble mode runs the offline retrieval fallback first, then a live claim-normalization call, one live image-review call per image, "
+                "and one live text-only aggregation call per row before promoting the live answer only when it is cleaner or better grounded."
+            )
+        else:
+            latency_note = "Live mode performs one claim-normalization call, one image-review call per image, and one text-only aggregation call per row. Oversized images are compressed for inline transport and retried with provider/model fallbacks when needed."
     else:
         model_calls = 0
         token_in = 0
         token_out = 0
         cost_assumption = "Live provider keys were not available in the local environment, so the offline retrieval fallback was executed at zero API cost."
+        latency_note = "Offline retrieval mode compares local images against the sample-set exemplars and applies deterministic rule arbitration without external model calls."
     return {
         "approx_model_calls": model_calls,
         "approx_input_tokens": token_in,
         "approx_output_tokens": token_out,
         "images_processed": reviewer.runtime_stats.images_processed,
         "cost_assumption": cost_assumption,
-        "latency_note": "Live mode performs one claim-normalization call, one image-review call per image, and one text-only aggregation call per row. Oversized images are compressed for inline transport and retried with provider/model fallbacks when needed.",
+        "latency_note": latency_note,
         "rate_limit_note": "The pipeline is sequential by default, cache-aware, and retries across current NIM-compatible multimodal models before dropping to the offline retrieval fallback.",
     }

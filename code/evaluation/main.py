@@ -40,12 +40,22 @@ def main() -> int:
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[2]
     config = AppConfig.from_repo(repo_root)
-    reviewer = ClaimReviewer(config)
     sample_rows = read_csv_rows(repo_root / args.sample)
 
-    baseline_predictions = reviewer.predict_rows(sample_rows, strategy="text_baseline")
-    retrieval_predictions = reviewer.predict_rows(sample_rows, strategy="retrieval")
-    hybrid_predictions = reviewer.predict_rows(sample_rows, strategy="hybrid") if config.enable_live_models else retrieval_predictions
+    baseline_reviewer = ClaimReviewer(config)
+    baseline_predictions = baseline_reviewer.predict_rows(sample_rows, strategy="text_baseline")
+    retrieval_reviewer = ClaimReviewer(config)
+    retrieval_predictions = retrieval_reviewer.predict_rows(sample_rows, strategy="retrieval")
+    if config.enable_live_models:
+        hybrid_reviewer = ClaimReviewer(config)
+        hybrid_predictions = hybrid_reviewer.predict_rows(sample_rows, strategy="hybrid")
+        ensemble_reviewer = ClaimReviewer(config)
+        ensemble_predictions = ensemble_reviewer.predict_rows(sample_rows, strategy="ensemble")
+    else:
+        hybrid_reviewer = retrieval_reviewer
+        ensemble_reviewer = retrieval_reviewer
+        hybrid_predictions = retrieval_predictions
+        ensemble_predictions = retrieval_predictions
 
     baseline_metric = evaluate_predictions(
         sample_rows,
@@ -65,17 +75,38 @@ def main() -> int:
         strategy_name="hybrid" if config.enable_live_models else "retrieval",
         notes="Live per-image multimodal review plus claim aggregation when keys are present, otherwise retrieval plus rule arbitration.",
     )
+    ensemble_metric = evaluate_predictions(
+        sample_rows,
+        [prediction.values for prediction in ensemble_predictions],
+        strategy_name="ensemble" if config.enable_live_models else "retrieval",
+        notes="Retrieval-first arbitration that promotes live multimodal outputs only when the live decision is cleaner or more grounded than the fallback.",
+    )
     candidates = [retrieval_metric]
     if config.enable_live_models:
-        candidates.append(hybrid_metric)
+        candidates.extend([hybrid_metric, ensemble_metric])
     final_metric = max(candidates, key=lambda metric: metric.exact_match_accuracy)
-    final_predictions = hybrid_predictions if final_metric.name == "hybrid" else retrieval_predictions
+    final_predictions_map = {
+        "retrieval": retrieval_predictions,
+        "hybrid": hybrid_predictions,
+        "ensemble": ensemble_predictions,
+    }
+    final_reviewers = {
+        "retrieval": retrieval_reviewer,
+        "hybrid": hybrid_reviewer,
+        "ensemble": ensemble_reviewer,
+    }
+    final_predictions = final_predictions_map[final_metric.name]
 
     avg_images = sum(len(row["image_paths"].split(";")) for row in sample_rows) / max(1, len(sample_rows))
-    ops = build_operational_notes(reviewer, total_rows=len(sample_rows), avg_images_per_row=avg_images)
+    ops = build_operational_notes(
+        final_reviewers[final_metric.name],
+        total_rows=len(sample_rows),
+        avg_images_per_row=avg_images,
+        strategy_name=final_metric.name,
+    )
     metrics = [baseline_metric, retrieval_metric]
     if config.enable_live_models:
-        metrics.append(hybrid_metric)
+        metrics.extend([hybrid_metric, ensemble_metric])
     write_markdown_report(repo_root / args.report, metrics, final_metric.name, ops)
     write_html_report(
         repo_root / args.html,
@@ -91,6 +122,10 @@ def main() -> int:
         write_csv_rows(
             repo_root / "code" / "evaluation" / "hybrid_sample_predictions.csv",
             [prediction.values for prediction in hybrid_predictions],
+        )
+        write_csv_rows(
+            repo_root / "code" / "evaluation" / "ensemble_sample_predictions.csv",
+            [prediction.values for prediction in ensemble_predictions],
         )
     print(f"Report written to {repo_root / args.report}")
     print(f"HTML explorer written to {repo_root / args.html}")

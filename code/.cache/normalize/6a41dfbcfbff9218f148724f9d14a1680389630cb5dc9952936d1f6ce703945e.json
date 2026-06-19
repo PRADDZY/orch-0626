@@ -1,0 +1,11 @@
+{
+  "claim_summary": "The customer spilled water damage to the keyboard, resulting in a stain and sticky keys.",
+  "issue_type": "water_damage",
+  "object_part": "keyboard",
+  "claimed_parts": [
+    "keyboard"
+  ],
+  "mentions_multiple_parts": false,
+  "prompt_injection_detected": false,
+  "confidence": 1.0
+}

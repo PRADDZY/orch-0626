@@ -1,0 +1,14 @@
+{
+  "observed_object_type": "laptop",
+  "visible_issue_type": "water_damage",
+  "visible_object_part": "keyboard",
+  "evidence_sufficient": true,
+  "claimed_part_visible": true,
+  "claim_status": "supported",
+  "severity": "medium",
+  "risk_flags": [
+    "non_original_image"
+  ],
+  "justification": "The image clearly shows a laptop keyboard with liquid droplets and puddles on the surface, supporting the claim of water damage. However, the image appears to be a high-quality stock photo rather than a user-submitted photo of a specific damaged device.",
+  "confidence": 1.0
+}

@@ -1,4 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
-code/.cache/
+code/.cache/*
+!code/.cache/normalize/
+!code/.cache/image_review/
+code/.cache/normalize/*
+code/.cache/image_review/*
+!code/.cache/normalize/229a434ed463d08b48fc0dbf2ace94ab4de4c912b031ff42a0f6dd2992a53197.json
+!code/.cache/normalize/6a41dfbcfbff9218f148724f9d14a1680389630cb5dc9952936d1f6ce703945e.json
+!code/.cache/image_review/b683f8c29a73e9961b5044602527eb9110b929abae448d97d4fc37a64bd66e97.json
+!code/.cache/image_review/8b13cfc7b3ce74b66d238562c88b14d1eca8d6f4928debfbd894f75b046cdd9f.json
+submission/

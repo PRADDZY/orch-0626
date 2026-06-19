@@ -1,0 +1,12 @@
+{
+  "claim_summary": "Laptop hinge is broken after being dropped",
+  "issue_type": "broken_part",
+  "object_part": "hinge",
+  "claimed_parts": [
+    "hinge",
+    "screen"
+  ],
+  "mentions_multiple_parts": true,
+  "prompt_injection_detected": false,
+  "confidence": 0.9
+}
