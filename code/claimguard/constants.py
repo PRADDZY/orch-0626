@@ -189,6 +189,6 @@ DEFAULT_SEVERITY_BY_ISSUE = {
 }
 
 MODEL_DEFAULTS = {
-    "nim": "stepfun-ai/step-3.7-flash",
+    "nim": "meta/llama-3.2-90b-vision-instruct",
     "openrouter": "qwen/qwen2.5-vl-72b-instruct",
 }

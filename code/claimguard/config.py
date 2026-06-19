@@ -60,7 +60,7 @@ class AppConfig:
             repo_root=repo_root,
             code_root=code_root,
             cache_dir=cache_dir,
-            prompt_version=os.getenv("PROMPT_VERSION", "v1"),
+            prompt_version=os.getenv("PROMPT_VERSION", "v6"),
             primary_provider=primary,
             fallback_provider=fallback,
             enable_live_models=primary.enabled or fallback.enabled,

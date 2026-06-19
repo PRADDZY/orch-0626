@@ -74,6 +74,86 @@ def stable_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    return default
+
+
+def coerce_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        if not value.strip() or value.strip().lower() == "none":
+            return []
+        return [item.strip() for item in re.split(r"[;,]", value) if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def normalize_issue_value(value: str, fallback: str = "unknown") -> str:
+    normalized = lower_alnum(value)
+    direct = normalized.replace(" ", "_")
+    if direct in ISSUE_TYPES:
+        return direct
+    for label, phrases in ISSUE_KEYWORDS.items():
+        if label in normalized or any(phrase in normalized for phrase in phrases):
+            return label
+    if any(term in normalized for term in {"no damage", "no visible damage", "intact", "undamaged", "no issue"}):
+        return "none"
+    return fallback if fallback in ISSUE_TYPES else "unknown"
+
+
+def normalize_object_part_value(value: str, claim_object: str, fallback: str = "unknown") -> str:
+    normalized = lower_alnum(value)
+    direct = normalized.replace(" ", "_")
+    allowed_parts = OBJECT_PARTS[claim_object]
+    if direct in allowed_parts:
+        return direct
+    options = {
+        label: [label.replace("_", " "), *phrases]
+        for label, phrases in PART_KEYWORDS.get(claim_object, {}).items()
+    }
+    hits = keyword_match(normalized, options)
+    if hits:
+        return hits[0]
+    return fallback if fallback in allowed_parts else "unknown"
+
+
+def normalize_claim_status_value(value: str, fallback: str = "not_enough_information") -> str:
+    normalized = lower_alnum(value)
+    direct = normalized.replace(" ", "_")
+    if direct in CLAIM_STATUSES:
+        return direct
+    if any(term in normalized for term in {"support", "confirmed", "match"}):
+        return "supported"
+    if any(term in normalized for term in {"contradict", "false", "wrong", "invalid", "mismatch"}):
+        return "contradicted"
+    return fallback
+
+
+def normalize_severity_value(value: str, issue_type: str, claim_status: str, risk_flags: list[str]) -> str:
+    normalized = lower_alnum(value).replace(" ", "_")
+    if normalized in SEVERITIES:
+        severity = normalized
+    else:
+        severity = choose_severity(issue_type)
+    if claim_status == "not_enough_information":
+        return "unknown"
+    if claim_status == "contradicted" and issue_type == "none":
+        return "none"
+    if claim_status == "contradicted" and "wrong_object" in risk_flags and severity == "unknown":
+        return "low"
+    return severity
+
+
 def extract_customer_text(transcript: str) -> str:
     chunks = []
     for segment in transcript.split("|"):
@@ -106,7 +186,10 @@ def parse_claim_heuristic(user_claim: str, claim_object: str) -> ParsedClaim:
     issue_hits = keyword_match(text, ISSUE_KEYWORDS)
     part_hits = keyword_match(text, PART_KEYWORDS.get(claim_object, {}))
     injection = any(phrase in text for phrase in PROMPT_INJECTION_PATTERNS)
-    multiple_parts = len(part_hits) > 1 or "two things" in text or "multiple parts" in text
+    multiple_parts = (
+        len(part_hits) > 1
+        and any(token in f" {text} " for token in (" and ", " both ", " multiple ", " two ", " plus "))
+    ) or "two things" in text or "multiple parts" in text
     issue_type = issue_hits[0] if issue_hits else "unknown"
     object_part = part_hits[0] if part_hits else "unknown"
     summary_bits = [claim_object]
@@ -177,11 +260,11 @@ def analyze_image_qc(image_path: Path, image_id: str) -> ImageQC:
             pixels = list(gray.getdata())
             bright_fraction = sum(1 for pixel in pixels if pixel >= 245) / max(1, len(pixels))
             risk_flags: list[str] = []
-            if edge_variance < 120:
+            if edge_variance < 140:
                 risk_flags.append("blurry_image")
-            if brightness < 40 or bright_fraction > 0.28:
+            if brightness < 28 or bright_fraction > 0.35:
                 risk_flags.append("low_light_or_glare")
-            if min(width, height) < 180:
+            if min(width, height) < 120:
                 risk_flags.append("cropped_or_obstructed")
             return ImageQC(
                 image_path=image_path,
@@ -409,18 +492,38 @@ class ClaimReviewer:
             self.runtime_stats.output_tokens_estimate += 180
         risk_flags = [flag for flag in payload.get("risk_flags", []) if flag in RISK_FLAGS and flag != "none"]
         risk_flags.extend(flag for flag in qc.risk_flags if flag not in risk_flags)
+        observed_object_raw = lower_alnum(str(payload.get("observed_object_type", row["claim_object"])))
+        if "car" in observed_object_raw or "bumper" in observed_object_raw or "hood" in observed_object_raw:
+            observed_object_type = "car"
+        elif any(token in observed_object_raw for token in {"laptop", "keyboard", "screen", "trackpad", "hinge"}):
+            observed_object_type = "laptop"
+        elif any(token in observed_object_raw for token in {"package", "box", "parcel", "shipping"}):
+            observed_object_type = "package"
+        elif observed_object_raw in {"other", "unknown"}:
+            observed_object_type = observed_object_raw
+        else:
+            observed_object_type = "other"
+        if observed_object_type not in {row["claim_object"], "unknown"} and "wrong_object" not in risk_flags:
+            risk_flags.append("wrong_object")
         claim_status = payload.get("claim_status", "not_enough_information")
         if claim_status not in CLAIM_STATUSES:
             claim_status = "not_enough_information"
+        if "wrong_object" in risk_flags and claim_status == "supported":
+            claim_status = "contradicted"
         issue_type = payload.get("visible_issue_type", "unknown")
         if issue_type not in ISSUE_TYPES:
             issue_type = "unknown"
         object_part = payload.get("visible_object_part", "unknown")
         if object_part not in OBJECT_PARTS[row["claim_object"]]:
             object_part = "unknown"
+        if "wrong_object" in risk_flags:
+            issue_type = "unknown"
+            object_part = "unknown"
         severity = payload.get("severity", choose_severity(issue_type))
         if severity not in SEVERITIES:
             severity = choose_severity(issue_type)
+        if claim_status == "contradicted" and "wrong_object" in risk_flags:
+            severity = "low"
         return ImageReview(
             image_id=qc.image_id,
             claim_status=claim_status,
@@ -433,6 +536,164 @@ class ClaimReviewer:
             justification=normalize_spaces(payload.get("justification", "Visual evidence was reviewed.")),
             confidence=float(payload.get("confidence", 0.5)),
         )
+
+    def _provider_predict_row(
+        self,
+        row: dict[str, str],
+        parsed: ParsedClaim,
+        qcs: list[ImageQC],
+        reviews: list[ImageReview],
+    ) -> Prediction | None:
+        if not self.providers:
+            return None
+        cache_key = stable_hash(
+            f"{self.config.prompt_version}|claim_aggregate|{row['claim_object']}|{row['user_claim']}|{row['image_paths']}"
+        )
+        payload = self._load_cache("claim_review", cache_key)
+        if payload is None:
+            provider = self.providers[0]
+            payload = provider.aggregate_claim(
+                user_claim=row["user_claim"],
+                claim_object=row["claim_object"],
+                parsed_summary=parsed.claim_summary,
+                parsed_issue_type=parsed.issue_type,
+                parsed_object_part=parsed.object_part,
+                image_reviews=[
+                    {
+                        "image_id": review.image_id,
+                        "claim_status": review.claim_status,
+                        "visible_issue_type": review.visible_issue_type,
+                        "visible_object_part": review.visible_object_part,
+                        "evidence_sufficient": review.evidence_sufficient,
+                        "claimed_part_visible": review.claimed_part_visible,
+                        "severity": review.severity,
+                        "risk_flags": review.risk_flags,
+                        "justification": review.justification,
+                        "confidence": review.confidence,
+                    }
+                    for review in reviews
+                ],
+                evidence_rules=self._evidence_rules(row["claim_object"], parsed.issue_type),
+                allowed_parts=sorted(OBJECT_PARTS[row["claim_object"]]),
+                allowed_issues=sorted(ISSUE_TYPES),
+                allowed_risk_flags=RISK_FLAG_ORDER,
+                history_flags=self._history_risk_flags(row["user_id"]),
+            )
+            if not payload:
+                return None
+            self._save_cache("claim_review", cache_key, payload)
+            self.runtime_stats.provider_calls += 1
+            self.runtime_stats.input_tokens_estimate += max(250, len(row["user_claim"]) // 2 + 90 * max(1, len(reviews)))
+            self.runtime_stats.output_tokens_estimate += 220
+        elif not payload:
+            return None
+
+        issue_type = normalize_issue_value(str(payload.get("issue_type", parsed.issue_type)), fallback=parsed.issue_type)
+        object_part = normalize_object_part_value(
+            str(payload.get("object_part", parsed.object_part)),
+            row["claim_object"],
+            fallback=parsed.object_part,
+        )
+        risk_flags = [
+            flag
+            for flag in coerce_list(payload.get("risk_flags", []))
+            if flag in RISK_FLAGS and flag != "none"
+        ]
+        for qc in qcs:
+            if not qc.usable and "cropped_or_obstructed" not in risk_flags:
+                risk_flags.append("cropped_or_obstructed")
+            if qc.edge_variance < 140 and "blurry_image" not in risk_flags:
+                risk_flags.append("blurry_image")
+            if (qc.brightness < 24 or qc.bright_fraction > 0.4) and "low_light_or_glare" not in risk_flags:
+                risk_flags.append("low_light_or_glare")
+        for flag in self._history_risk_flags(row["user_id"]):
+            if flag not in risk_flags:
+                risk_flags.append(flag)
+        if parsed.prompt_injection_detected and "text_instruction_present" not in risk_flags:
+            risk_flags.append("text_instruction_present")
+
+        claim_status = normalize_claim_status_value(str(payload.get("claim_status", "not_enough_information")))
+        if claim_status == "supported" and any(
+            flag in risk_flags for flag in {"wrong_object", "claim_mismatch", "non_original_image", "possible_manipulation"}
+        ):
+            claim_status = "not_enough_information"
+        if claim_status == "supported" and issue_type == "unknown":
+            claim_status = "not_enough_information"
+        evidence_standard_met = coerce_bool(payload.get("evidence_standard_met"), default=claim_status != "not_enough_information")
+        if claim_status == "not_enough_information" or not any(qc.usable for qc in qcs):
+            evidence_standard_met = False
+
+        valid_image = coerce_bool(payload.get("valid_image"), default=any(qc.usable for qc in qcs))
+        if any(flag in risk_flags for flag in {"non_original_image", "possible_manipulation"}) or not any(qc.usable for qc in qcs):
+            valid_image = False
+
+        if claim_status == "not_enough_information" and "damage_not_visible" not in risk_flags:
+            risk_flags.append("damage_not_visible")
+        if any(flag in risk_flags for flag in {"wrong_object", "claim_mismatch", "possible_manipulation", "non_original_image", "text_instruction_present"}):
+            if "manual_review_required" not in risk_flags:
+                risk_flags.append("manual_review_required")
+        if "user_history_risk" in risk_flags and "manual_review_required" not in risk_flags:
+            risk_flags.append("manual_review_required")
+
+        supporting_ids = [
+            image_id
+            for image_id in coerce_list(payload.get("supporting_image_ids", []))
+            if any(qc.image_id == image_id for qc in qcs)
+        ]
+        if claim_status != "not_enough_information" and not supporting_ids and qcs:
+            supporting_ids = [qcs[0].image_id]
+        supporting_ids = list(dict.fromkeys(supporting_ids))
+        supporting_image_ids = ";".join(supporting_ids) if supporting_ids else "none"
+
+        severity = normalize_severity_value(
+            str(payload.get("severity", choose_severity(issue_type))),
+            issue_type,
+            claim_status,
+            risk_flags,
+        )
+        if claim_status == "contradicted" and "wrong_object" in risk_flags and issue_type == "unknown":
+            object_part = "unknown"
+
+        evidence_reason = normalize_spaces(
+            str(
+                payload.get(
+                    "evidence_standard_met_reason",
+                    "The submitted images are clear enough to evaluate the claim."
+                    if evidence_standard_met
+                    else "The submitted images do not provide enough reliable evidence to evaluate the claim.",
+                )
+            )
+        )
+        status_justification = normalize_spaces(
+            str(
+                payload.get(
+                    "claim_status_justification",
+                    "The multimodal reviewer evaluated the full image set against the stated claim.",
+                )
+            )
+        )
+        if not evidence_standard_met and claim_status == "not_enough_information" and "not enough" not in lower_alnum(status_justification):
+            status_justification = normalize_spaces(
+                status_justification + " The image set is not strong enough for a definitive confirmation or contradiction."
+            )
+
+        values = {
+            "user_id": row["user_id"],
+            "image_paths": row["image_paths"],
+            "user_claim": row["user_claim"],
+            "claim_object": row["claim_object"],
+            "evidence_standard_met": to_bool_text(evidence_standard_met),
+            "evidence_standard_met_reason": evidence_reason,
+            "risk_flags": ";".join(flag for flag in RISK_FLAG_ORDER if flag in risk_flags) if risk_flags else "none",
+            "issue_type": issue_type if issue_type in ISSUE_TYPES else "unknown",
+            "object_part": object_part if object_part in OBJECT_PARTS[row["claim_object"]] else "unknown",
+            "claim_status": claim_status,
+            "claim_status_justification": status_justification,
+            "supporting_image_ids": supporting_image_ids,
+            "valid_image": to_bool_text(valid_image),
+            "severity": severity if severity in SEVERITIES else "unknown",
+        }
+        return Prediction(row=row, values=values)
 
     def _fallback_review(self, row: dict[str, str], parsed: ParsedClaim, qcs: list[ImageQC]) -> list[ImageReview]:
         image_paths = [qc.image_path for qc in qcs if qc.usable]
@@ -638,8 +899,6 @@ class ClaimReviewer:
 
     def predict_row(self, row: dict[str, str], strategy: str = "hybrid") -> Prediction:
         parsed = parse_claim_heuristic(row["user_claim"], row["claim_object"])
-        if strategy == "hybrid" and self.providers:
-            parsed = self._provider_normalize_claim(row, parsed)
 
         relative_paths = [item.strip() for item in row["image_paths"].split(";") if item.strip()]
         qcs = []
@@ -667,6 +926,9 @@ class ClaimReviewer:
             ]
         elif strategy == "hybrid" and self.providers:
             reviews = [self._provider_review_image(row, parsed, qc) for qc in qcs]
+            prediction = self._provider_predict_row(row, parsed, qcs, reviews)
+            if prediction is not None:
+                return prediction
         else:
             reviews = self._fallback_review(row, parsed, qcs)
         return self._aggregate_prediction(row, parsed, qcs, reviews)
@@ -716,9 +978,9 @@ def evaluate_predictions(
 def build_operational_notes(reviewer: ClaimReviewer, total_rows: int, avg_images_per_row: float) -> dict[str, Any]:
     live_path = reviewer.config.enable_live_models
     if live_path:
-        model_calls = total_rows * (1 + math.ceil(avg_images_per_row))
-        token_in = model_calls * 220
-        token_out = model_calls * 180
+        model_calls = reviewer.runtime_stats.provider_calls or total_rows
+        token_in = reviewer.runtime_stats.input_tokens_estimate or model_calls * 900
+        token_out = reviewer.runtime_stats.output_tokens_estimate or model_calls * 250
         cost_assumption = "NVIDIA Build developer endpoint assumed to be free during hackathon development; OpenRouter fallback cost not incurred unless explicitly enabled."
     else:
         model_calls = 0
@@ -731,6 +993,6 @@ def build_operational_notes(reviewer: ClaimReviewer, total_rows: int, avg_images
         "approx_output_tokens": token_out,
         "images_processed": reviewer.runtime_stats.images_processed,
         "cost_assumption": cost_assumption,
-        "latency_note": "Live mode is designed for one normalization call plus one image-review call per image, with file-backed caching to avoid repeats.",
+        "latency_note": "Live mode performs one row-level multimodal review per claim and reuses file-backed caches on repeated runs.",
         "rate_limit_note": "The pipeline is sequential by default, cache-aware, and can be batched later if provider RPM limits become visible during a live run.",
     }
