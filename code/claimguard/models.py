@@ -66,4 +66,25 @@ class RuntimeStats:
     output_tokens_estimate: int = 0
     images_processed: int = 0
     cache_hits: int = 0
+    logical_normalize_calls: int = 0
+    logical_image_review_calls: int = 0
+    logical_claim_aggregate_calls: int = 0
+    logical_input_tokens_estimate: int = 0
+    logical_output_tokens_estimate: int = 0
+
+    @property
+    def logical_provider_calls(self) -> int:
+        return self.logical_normalize_calls + self.logical_image_review_calls + self.logical_claim_aggregate_calls
+
+    def merge(self, other: "RuntimeStats") -> None:
+        self.provider_calls += other.provider_calls
+        self.input_tokens_estimate += other.input_tokens_estimate
+        self.output_tokens_estimate += other.output_tokens_estimate
+        self.images_processed += other.images_processed
+        self.cache_hits += other.cache_hits
+        self.logical_normalize_calls += other.logical_normalize_calls
+        self.logical_image_review_calls += other.logical_image_review_calls
+        self.logical_claim_aggregate_calls += other.logical_claim_aggregate_calls
+        self.logical_input_tokens_estimate += other.logical_input_tokens_estimate
+        self.logical_output_tokens_estimate += other.logical_output_tokens_estimate
 

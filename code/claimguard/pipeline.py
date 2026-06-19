@@ -340,22 +340,31 @@ class SampleMatcher:
             )
         return entries
 
-    def score(self, target_features: list[dict[str, Any]], exemplar: dict[str, Any], parsed: ParsedClaim) -> float:
+    def score(
+        self,
+        target_features: list[tuple[int, dict[str, Any]]],
+        exemplar: dict[str, Any],
+        parsed: ParsedClaim,
+    ) -> tuple[float, int | None]:
         if not target_features or not exemplar["features"]:
             image_score = 0.0
+            best_target_index: int | None = None
         else:
             image_score = 0.0
-            for target in target_features:
+            best_target_index = None
+            for target_index, target in target_features:
                 for candidate in exemplar["features"]:
                     score = (
                         hamming_similarity(target["ahash"], candidate["ahash"]) * 0.45
                         + hamming_similarity(target["dhash"], candidate["dhash"]) * 0.35
                         + color_similarity(target["color"], candidate["color"]) * 0.20
                     )
-                    image_score = max(image_score, score)
+                    if score > image_score:
+                        image_score = score
+                        best_target_index = target_index
         issue_bonus = 0.18 if parsed.issue_type != "unknown" and parsed.issue_type == exemplar["row"]["issue_type"] else 0.0
         part_bonus = 0.14 if parsed.object_part != "unknown" and parsed.object_part == exemplar["row"]["object_part"] else 0.0
-        return image_score * 0.68 + issue_bonus + part_bonus
+        return image_score * 0.68 + issue_bonus + part_bonus, best_target_index
 
     def best_match(
         self,
@@ -364,9 +373,9 @@ class SampleMatcher:
         image_paths: list[Path],
     ) -> dict[str, Any] | None:
         target_features = []
-        for image_path in image_paths:
+        for index, image_path in enumerate(image_paths):
             try:
-                target_features.append(self._image_features(image_path))
+                target_features.append((index, self._image_features(image_path)))
             except Exception:
                 continue
         best: dict[str, Any] | None = None
@@ -374,9 +383,9 @@ class SampleMatcher:
         for entry in self.entries:
             if entry["claim_object"] != claim_object:
                 continue
-            score = self.score(target_features, entry, parsed)
+            score, matched_target_index = self.score(target_features, entry, parsed)
             if score > best_score:
-                best = {"entry": entry, "score": score}
+                best = {"entry": entry, "score": score, "matched_target_index": matched_target_index}
                 best_score = score
         return best
 
@@ -465,6 +474,8 @@ class ClaimReviewer:
         flags = self._prediction_flags(prediction)
         if prediction.values["claim_status"] not in {"supported", "contradicted"}:
             return False
+        if prediction.values["issue_type"] == "missing_part" or prediction.values["object_part"] == "contents":
+            return False
         if prediction.values["evidence_standard_met"] != "true":
             return False
         if prediction.values["valid_image"] != "true":
@@ -502,6 +513,58 @@ class ClaimReviewer:
             return hybrid_prediction
 
         return retrieval_prediction
+
+    def _refine_ensemble_prediction(self, prediction: Prediction, live_reviews: list[ImageReview]) -> Prediction:
+        flags = self._prediction_flags(prediction)
+        refined_values = dict(prediction.values)
+
+        if prediction.values["claim_status"] == "supported":
+            matching_supported_reviews = [
+                review
+                for review in live_reviews
+                if review.claim_status == "supported"
+                and review.evidence_sufficient
+                and review.visible_issue_type == prediction.values["issue_type"]
+                and review.visible_object_part == prediction.values["object_part"]
+            ]
+            if len(matching_supported_reviews) == 1:
+                refined_values["supporting_image_ids"] = matching_supported_reviews[0].image_id
+
+        if (
+            prediction.values["claim_status"] == "contradicted"
+            and prediction.values["issue_type"] == "none"
+            and any(
+                review.claim_status == "contradicted"
+                and review.evidence_sufficient
+                and review.claimed_part_visible
+                and review.visible_object_part == prediction.values["object_part"]
+                for review in live_reviews
+            )
+        ):
+            flags.add("damage_not_visible")
+            flags.discard("claim_mismatch")
+
+        if prediction.values["claim_status"] == "not_enough_information":
+            insufficiency_flags = {
+                flag
+                for review in live_reviews
+                for flag in review.risk_flags
+                if flag in {"wrong_angle", "damage_not_visible", "cropped_or_obstructed"}
+            }
+            flags.update(insufficiency_flags)
+            if not any(review.claimed_part_visible for review in live_reviews):
+                refined_values["evidence_standard_met"] = "false"
+                refined_values["issue_type"] = "unknown"
+                refined_values["supporting_image_ids"] = "none"
+
+        if any("text_instruction_present" in review.risk_flags for review in live_reviews):
+            flags.add("text_instruction_present")
+            flags.add("manual_review_required")
+            if prediction.values["claim_status"] == "contradicted" and prediction.values["issue_type"] == "none":
+                flags.discard("claim_mismatch")
+                flags.add("damage_not_visible")
+        refined_values["risk_flags"] = ";".join(flag for flag in RISK_FLAG_ORDER if flag in flags) if flags else "none"
+        return Prediction(row=prediction.row, values=refined_values)
 
     def _aggregate_live_reviews_fallback(
         self,
@@ -661,6 +724,10 @@ class ClaimReviewer:
     def _provider_normalize_claim(self, row: dict[str, str], parsed: ParsedClaim) -> ParsedClaim:
         if not self.providers:
             return parsed
+        logical_input_tokens = max(80, len(row["user_claim"]) // 3)
+        self.runtime_stats.logical_normalize_calls += 1
+        self.runtime_stats.logical_input_tokens_estimate += logical_input_tokens
+        self.runtime_stats.logical_output_tokens_estimate += 120
         allowed_parts = sorted(OBJECT_PARTS[row["claim_object"]])
         allowed_issues = sorted(ISSUE_TYPES)
         cache_key = stable_hash(f"{self.config.prompt_version}|normalize|{row['claim_object']}|{row['user_claim']}")
@@ -676,7 +743,7 @@ class ClaimReviewer:
             )
             if payload:
                 self._save_cache("normalize", cache_key, payload)
-                self.runtime_stats.input_tokens_estimate += max(80, len(row["user_claim"]) // 3)
+                self.runtime_stats.input_tokens_estimate += logical_input_tokens
                 self.runtime_stats.output_tokens_estimate += 120
         if not payload:
             return parsed
@@ -709,6 +776,9 @@ class ClaimReviewer:
     ) -> ImageReview:
         if not self.providers:
             raise RuntimeError("provider review requested without any providers")
+        self.runtime_stats.logical_image_review_calls += 1
+        self.runtime_stats.logical_input_tokens_estimate += 200
+        self.runtime_stats.logical_output_tokens_estimate += 180
         cache_key = stable_hash(
             f"{self.config.prompt_version}|image|{row['claim_object']}|{parsed.claim_summary}|{qc.image_path}|{qc.edge_variance:.1f}"
         )
@@ -799,6 +869,10 @@ class ClaimReviewer:
     ) -> Prediction | None:
         if not self.providers:
             return None
+        logical_input_tokens = max(250, len(row["user_claim"]) // 2 + 90 * max(1, len(reviews)))
+        self.runtime_stats.logical_claim_aggregate_calls += 1
+        self.runtime_stats.logical_input_tokens_estimate += logical_input_tokens
+        self.runtime_stats.logical_output_tokens_estimate += 220
         cache_key = stable_hash(
             f"{self.config.prompt_version}|claim_aggregate|{row['claim_object']}|{row['user_claim']}|{row['image_paths']}"
         )
@@ -835,7 +909,7 @@ class ClaimReviewer:
             if not payload:
                 return None
             self._save_cache("claim_review", cache_key, payload)
-            self.runtime_stats.input_tokens_estimate += max(250, len(row["user_claim"]) // 2 + 90 * max(1, len(reviews)))
+            self.runtime_stats.input_tokens_estimate += logical_input_tokens
             self.runtime_stats.output_tokens_estimate += 220
         elif not payload:
             return None
@@ -1045,7 +1119,14 @@ class ClaimReviewer:
             ]
         exemplar = best["entry"]["row"]
         score = float(best["score"])
-        best_qc = max((qc for qc in qcs if qc.usable), key=lambda qc: qc.edge_variance, default=qcs[0] if qcs else None)
+        matched_target_index = best.get("matched_target_index")
+        best_qc = None
+        if isinstance(matched_target_index, int) and 0 <= matched_target_index < len(qcs):
+            candidate_qc = qcs[matched_target_index]
+            if candidate_qc.usable:
+                best_qc = candidate_qc
+        if best_qc is None:
+            best_qc = max((qc for qc in qcs if qc.usable), key=lambda qc: qc.edge_variance, default=qcs[0] if qcs else None)
         best_image_id = best_qc.image_id if best_qc else "none"
         claim_status = exemplar["claim_status"]
         evidence_sufficient = score >= 0.60 and any(qc.usable for qc in qcs)
@@ -1134,13 +1215,17 @@ class ClaimReviewer:
                 risk_flags.append(flag)
         if parsed.prompt_injection_detected and "text_instruction_present" not in risk_flags:
             risk_flags.append("text_instruction_present")
-        if parsed.mentions_multiple_parts and "manual_review_required" not in risk_flags:
+        if parsed.mentions_multiple_parts and chosen.claim_status == "not_enough_information" and "manual_review_required" not in risk_flags:
             risk_flags.append("manual_review_required")
         if any(flag in risk_flags for flag in {"claim_mismatch", "wrong_object", "wrong_object_part", "possible_manipulation", "non_original_image", "text_instruction_present"}):
             if "manual_review_required" not in risk_flags:
                 risk_flags.append("manual_review_required")
         if history_flags and "user_history_risk" in history_flags and "manual_review_required" not in risk_flags:
             risk_flags.append("manual_review_required")
+        if chosen.claim_status == "contradicted" and chosen.visible_issue_type == "none" and chosen.claimed_part_visible:
+            if "damage_not_visible" not in risk_flags:
+                risk_flags.append("damage_not_visible")
+            risk_flags = [flag for flag in risk_flags if flag != "claim_mismatch"]
         if chosen.claim_status == "not_enough_information" and chosen.visible_issue_type == "unknown" and "damage_not_visible" not in risk_flags:
             risk_flags.append("damage_not_visible")
         risk_flags = [flag for flag in RISK_FLAG_ORDER if flag in risk_flags]
@@ -1180,11 +1265,24 @@ class ClaimReviewer:
         if any(flag in risk_flags for flag in {"non_original_image", "possible_manipulation"}) and chosen.claim_status == "contradicted":
             valid_image = False
 
-        supporting_ids = [
-            review.image_id
-            for review in reviews
-            if review.claim_status == chosen.claim_status and review.claim_status != "not_enough_information"
-        ]
+        if chosen.claim_status == "supported":
+            supporting_ids = [
+                review.image_id
+                for review in reviews
+                if review.claim_status == "supported" and review.evidence_sufficient
+            ]
+            if not supporting_ids:
+                supporting_ids = [
+                    review.image_id
+                    for review in reviews
+                    if review.claim_status == "supported" and review.claim_status != "not_enough_information"
+                ]
+        else:
+            supporting_ids = [
+                review.image_id
+                for review in reviews
+                if review.claim_status == chosen.claim_status and review.claim_status != "not_enough_information"
+            ]
         supporting_ids = list(dict.fromkeys(item for item in supporting_ids if item != "none"))
         if not supporting_ids and chosen.claim_status != "not_enough_information":
             supporting_ids = [chosen.image_id] if chosen.image_id != "none" else []
@@ -1264,7 +1362,8 @@ class ClaimReviewer:
                 return prediction
             reviews = self._fallback_review(row, parsed, qcs)
         elif strategy == "ensemble":
-            retrieval_prediction = self._aggregate_prediction(row, parsed, qcs, self._fallback_review(row, parsed, qcs))
+            retrieval_reviews = self._fallback_review(row, parsed, qcs)
+            retrieval_prediction = self._aggregate_prediction(row, parsed, qcs, retrieval_reviews)
             if not self.providers:
                 return retrieval_prediction
             reviews = [self._provider_review_image(row, live_parsed, qc) for qc in qcs]
@@ -1273,7 +1372,8 @@ class ClaimReviewer:
                 prediction = self._aggregate_live_reviews_fallback(row, live_parsed, qcs, reviews)
             if prediction is None:
                 return retrieval_prediction
-            return self._choose_ensemble_prediction(retrieval_prediction, prediction)
+            chosen_prediction = self._choose_ensemble_prediction(retrieval_prediction, prediction)
+            return self._refine_ensemble_prediction(chosen_prediction, reviews)
         elif strategy == "hybrid":
             reviews = self._fallback_review(row, parsed, qcs)
         else:
@@ -1323,17 +1423,36 @@ def evaluate_predictions(
 
 
 def build_operational_notes(
-    reviewer: ClaimReviewer,
+    strategy_stats: RuntimeStats,
     total_rows: int,
     avg_images_per_row: float,
     strategy_name: str = "retrieval",
+    *,
+    live_models_enabled: bool = False,
+    evaluation_stats: RuntimeStats | None = None,
 ) -> dict[str, Any]:
-    live_path = strategy_name in {"hybrid", "ensemble"} and reviewer.config.enable_live_models and reviewer.runtime_stats.provider_calls > 0
-    if live_path:
-        model_calls = reviewer.runtime_stats.provider_calls or total_rows
-        token_in = reviewer.runtime_stats.input_tokens_estimate or model_calls * 900
-        token_out = reviewer.runtime_stats.output_tokens_estimate or model_calls * 250
-        cost_assumption = "NVIDIA Build developer endpoint assumed to be free during hackathon development; OpenRouter fallback cost not incurred unless explicitly enabled."
+    del total_rows, avg_images_per_row
+    evaluation_stats = evaluation_stats or strategy_stats
+    selected_strategy_live = strategy_name in {"hybrid", "ensemble"} and live_models_enabled and strategy_stats.logical_provider_calls > 0
+    evaluation_used_live = live_models_enabled and (
+        evaluation_stats.logical_provider_calls > 0 or evaluation_stats.provider_calls > 0 or evaluation_stats.cache_hits > 0
+    )
+    actual_provider_requests = evaluation_stats.provider_calls if evaluation_used_live else 0
+    cache_hits = evaluation_stats.cache_hits if evaluation_used_live else 0
+    if selected_strategy_live:
+        model_calls = strategy_stats.logical_provider_calls
+        token_in = strategy_stats.logical_input_tokens_estimate or model_calls * 900
+        token_out = strategy_stats.logical_output_tokens_estimate or model_calls * 250
+        if actual_provider_requests > 0:
+            cost_assumption = (
+                "Live provider keys were available and this evaluation run issued uncached provider requests. "
+                "Cache reuse may also have reduced repeated calls for already-warmed steps."
+            )
+        else:
+            cost_assumption = (
+                "Live provider keys were available, but this evaluation run was fully served from cached live responses "
+                "and issued no uncached provider requests."
+            )
         if strategy_name == "ensemble":
             latency_note = (
                 "Ensemble mode runs the offline retrieval fallback first, then a live claim-normalization call, one live image-review call per image, "
@@ -1341,6 +1460,19 @@ def build_operational_notes(
             )
         else:
             latency_note = "Live mode performs one claim-normalization call, one image-review call per image, and one text-only aggregation call per row. Oversized images are compressed for inline transport and retried with provider/model fallbacks when needed."
+        if cache_hits > 0:
+            latency_note += " This run also reused cached live responses for already-computed steps."
+    elif evaluation_used_live:
+        model_calls = 0
+        token_in = 0
+        token_out = 0
+        cost_assumption = (
+            "The selected strategy is offline retrieval, but live provider keys were available and this evaluation run still benchmarked live alternatives."
+        )
+        latency_note = (
+            "The selected strategy executes without external model calls. Live strategies were also evaluated during this run for comparison, "
+            "with cache reuse reducing repeated provider requests where possible."
+        )
     else:
         model_calls = 0
         token_in = 0
@@ -1351,7 +1483,9 @@ def build_operational_notes(
         "approx_model_calls": model_calls,
         "approx_input_tokens": token_in,
         "approx_output_tokens": token_out,
-        "images_processed": reviewer.runtime_stats.images_processed,
+        "actual_uncached_provider_requests": actual_provider_requests,
+        "cache_hits": cache_hits,
+        "images_processed": strategy_stats.images_processed,
         "cost_assumption": cost_assumption,
         "latency_note": latency_note,
         "rate_limit_note": "The pipeline is sequential by default, cache-aware, and retries across current NIM-compatible multimodal models before dropping to the offline retrieval fallback.",

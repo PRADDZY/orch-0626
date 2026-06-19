@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from claimguard.config import AppConfig
+from claimguard.models import RuntimeStats
 from claimguard.pipeline import (
     ClaimReviewer,
     build_operational_notes,
@@ -17,6 +18,13 @@ from claimguard.pipeline import (
     write_csv_rows,
 )
 from claimguard.reporting import write_html_report, write_markdown_report
+
+
+def merge_runtime_stats(reviewers: list[ClaimReviewer]) -> RuntimeStats:
+    merged = RuntimeStats()
+    for reviewer in reviewers:
+        merged.merge(reviewer.runtime_stats)
+    return merged
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,13 +104,19 @@ def main() -> int:
         "ensemble": ensemble_reviewer,
     }
     final_predictions = final_predictions_map[final_metric.name]
+    if config.enable_live_models:
+        evaluation_live_stats = merge_runtime_stats([hybrid_reviewer, ensemble_reviewer])
+    else:
+        evaluation_live_stats = merge_runtime_stats([retrieval_reviewer])
 
     avg_images = sum(len(row["image_paths"].split(";")) for row in sample_rows) / max(1, len(sample_rows))
     ops = build_operational_notes(
-        final_reviewers[final_metric.name],
+        final_reviewers[final_metric.name].runtime_stats,
         total_rows=len(sample_rows),
         avg_images_per_row=avg_images,
         strategy_name=final_metric.name,
+        live_models_enabled=config.enable_live_models,
+        evaluation_stats=evaluation_live_stats,
     )
     metrics = [baseline_metric, retrieval_metric]
     if config.enable_live_models:
