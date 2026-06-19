@@ -98,6 +98,15 @@ def coerce_list(value: Any) -> list[str]:
     return []
 
 
+def coerce_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def normalize_issue_value(value: str, fallback: str = "unknown") -> str:
     normalized = lower_alnum(value)
     direct = normalized.replace(" ", "_")
@@ -390,6 +399,18 @@ class ClaimReviewer:
             if provider_config.enabled
         ]
 
+    def _provider_chain(self, method_name: str, **kwargs: Any) -> dict[str, Any] | None:
+        for provider in self.providers:
+            try:
+                payload = getattr(provider, method_name)(**kwargs)
+            except Exception:
+                self.runtime_stats.provider_calls += 1
+                continue
+            self.runtime_stats.provider_calls += 1
+            if payload:
+                return payload
+        return None
+
     def _cache_path(self, namespace: str, cache_key: str) -> Path:
         directory = self.config.cache_dir / namespace
         directory.mkdir(parents=True, exist_ok=True)
@@ -440,12 +461,19 @@ class ClaimReviewer:
         cached = self._load_cache("normalize", cache_key)
         payload = cached
         if payload is None:
-            provider = self.providers[0]
-            payload = provider.normalize_claim(row["user_claim"], row["claim_object"], allowed_parts, allowed_issues)
-            self._save_cache("normalize", cache_key, payload)
-            self.runtime_stats.provider_calls += 1
-            self.runtime_stats.input_tokens_estimate += max(80, len(row["user_claim"]) // 3)
-            self.runtime_stats.output_tokens_estimate += 120
+            payload = self._provider_chain(
+                "normalize_claim",
+                transcript=row["user_claim"],
+                claim_object=row["claim_object"],
+                allowed_parts=allowed_parts,
+                allowed_issues=allowed_issues,
+            )
+            if payload:
+                self._save_cache("normalize", cache_key, payload)
+                self.runtime_stats.input_tokens_estimate += max(80, len(row["user_claim"]) // 3)
+                self.runtime_stats.output_tokens_estimate += 120
+        if not payload:
+            return parsed
         issue_type = payload.get("issue_type", parsed.issue_type)
         if issue_type not in ISSUE_TYPES:
             issue_type = parsed.issue_type
@@ -460,7 +488,7 @@ class ClaimReviewer:
             claimed_parts=claimed_parts or parsed.claimed_parts,
             mentions_multiple_parts=bool(payload.get("mentions_multiple_parts", parsed.mentions_multiple_parts)),
             prompt_injection_detected=bool(payload.get("prompt_injection_detected", parsed.prompt_injection_detected)),
-            confidence=float(payload.get("confidence", parsed.confidence or 0.0)),
+            confidence=coerce_float(payload.get("confidence"), parsed.confidence or 0.0),
         )
 
     def _provider_review_image(
@@ -477,8 +505,8 @@ class ClaimReviewer:
         cached = self._load_cache("image_review", cache_key)
         payload = cached
         if payload is None:
-            provider = self.providers[0]
-            payload = provider.review_image(
+            payload = self._provider_chain(
+                "review_image",
                 image_path=qc.image_path,
                 claim_object=row["claim_object"],
                 claim_summary=parsed.claim_summary,
@@ -486,10 +514,23 @@ class ClaimReviewer:
                 object_part=parsed.object_part,
                 evidence_rules=self._evidence_rules(row["claim_object"], parsed.issue_type),
             )
-            self._save_cache("image_review", cache_key, payload)
-            self.runtime_stats.provider_calls += 1
-            self.runtime_stats.input_tokens_estimate += 200
-            self.runtime_stats.output_tokens_estimate += 180
+            if payload:
+                self._save_cache("image_review", cache_key, payload)
+                self.runtime_stats.input_tokens_estimate += 200
+                self.runtime_stats.output_tokens_estimate += 180
+        if not payload:
+            return ImageReview(
+                image_id=qc.image_id,
+                claim_status="not_enough_information",
+                visible_issue_type="unknown",
+                visible_object_part=parsed.object_part if parsed.object_part != "unknown" else "unknown",
+                evidence_sufficient=False,
+                claimed_part_visible=False,
+                severity="unknown",
+                risk_flags=list(qc.risk_flags),
+                justification="The live multimodal reviewer could not return a stable result for this image.",
+                confidence=0.1,
+            )
         risk_flags = [flag for flag in payload.get("risk_flags", []) if flag in RISK_FLAGS and flag != "none"]
         risk_flags.extend(flag for flag in qc.risk_flags if flag not in risk_flags)
         observed_object_raw = lower_alnum(str(payload.get("observed_object_type", row["claim_object"])))
@@ -510,7 +551,7 @@ class ClaimReviewer:
             claim_status = "not_enough_information"
         if "wrong_object" in risk_flags and claim_status == "supported":
             claim_status = "contradicted"
-        issue_type = payload.get("visible_issue_type", "unknown")
+        issue_type = payload.get("visible_issue_type") or payload.get("visible_issue_issue_type") or payload.get("issue_type", "unknown")
         if issue_type not in ISSUE_TYPES:
             issue_type = "unknown"
         object_part = payload.get("visible_object_part", "unknown")
@@ -520,6 +561,8 @@ class ClaimReviewer:
             issue_type = "unknown"
             object_part = "unknown"
         severity = payload.get("severity", choose_severity(issue_type))
+        if severity == "severe":
+            severity = "high"
         if severity not in SEVERITIES:
             severity = choose_severity(issue_type)
         if claim_status == "contradicted" and "wrong_object" in risk_flags:
@@ -534,7 +577,7 @@ class ClaimReviewer:
             severity=severity,
             risk_flags=risk_flags,
             justification=normalize_spaces(payload.get("justification", "Visual evidence was reviewed.")),
-            confidence=float(payload.get("confidence", 0.5)),
+            confidence=coerce_float(payload.get("confidence"), 0.5),
         )
 
     def _provider_predict_row(
@@ -551,8 +594,8 @@ class ClaimReviewer:
         )
         payload = self._load_cache("claim_review", cache_key)
         if payload is None:
-            provider = self.providers[0]
-            payload = provider.aggregate_claim(
+            payload = self._provider_chain(
+                "aggregate_claim",
                 user_claim=row["user_claim"],
                 claim_object=row["claim_object"],
                 parsed_summary=parsed.claim_summary,
@@ -582,7 +625,6 @@ class ClaimReviewer:
             if not payload:
                 return None
             self._save_cache("claim_review", cache_key, payload)
-            self.runtime_stats.provider_calls += 1
             self.runtime_stats.input_tokens_estimate += max(250, len(row["user_claim"]) // 2 + 90 * max(1, len(reviews)))
             self.runtime_stats.output_tokens_estimate += 220
         elif not payload:
@@ -993,6 +1035,6 @@ def build_operational_notes(reviewer: ClaimReviewer, total_rows: int, avg_images
         "approx_output_tokens": token_out,
         "images_processed": reviewer.runtime_stats.images_processed,
         "cost_assumption": cost_assumption,
-        "latency_note": "Live mode performs one row-level multimodal review per claim and reuses file-backed caches on repeated runs.",
-        "rate_limit_note": "The pipeline is sequential by default, cache-aware, and can be batched later if provider RPM limits become visible during a live run.",
+        "latency_note": "Live mode performs one claim-normalization call, one image-review call per image, and one text-only aggregation call per row. Oversized images are compressed for inline transport and retried with provider/model fallbacks when needed.",
+        "rate_limit_note": "The pipeline is sequential by default, cache-aware, and retries across current NIM-compatible multimodal models before dropping to the offline retrieval fallback.",
     }

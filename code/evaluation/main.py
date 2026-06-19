@@ -44,8 +44,8 @@ def main() -> int:
     sample_rows = read_csv_rows(repo_root / args.sample)
 
     baseline_predictions = reviewer.predict_rows(sample_rows, strategy="text_baseline")
-    fallback_or_hybrid = "hybrid" if config.enable_live_models else "retrieval"
-    final_predictions = reviewer.predict_rows(sample_rows, strategy=fallback_or_hybrid)
+    retrieval_predictions = reviewer.predict_rows(sample_rows, strategy="retrieval")
+    hybrid_predictions = reviewer.predict_rows(sample_rows, strategy="hybrid") if config.enable_live_models else retrieval_predictions
 
     baseline_metric = evaluate_predictions(
         sample_rows,
@@ -53,16 +53,30 @@ def main() -> int:
         strategy_name="text_baseline",
         notes="Transcript parsing with image quality checks only.",
     )
-    final_metric = evaluate_predictions(
+    retrieval_metric = evaluate_predictions(
         sample_rows,
-        [prediction.values for prediction in final_predictions],
-        strategy_name=fallback_or_hybrid,
-        notes="Live multimodal review when keys are present, otherwise retrieval plus rule arbitration.",
+        [prediction.values for prediction in retrieval_predictions],
+        strategy_name="retrieval",
+        notes="Offline retrieval plus rule arbitration.",
     )
+    hybrid_metric = evaluate_predictions(
+        sample_rows,
+        [prediction.values for prediction in hybrid_predictions],
+        strategy_name="hybrid" if config.enable_live_models else "retrieval",
+        notes="Live per-image multimodal review plus claim aggregation when keys are present, otherwise retrieval plus rule arbitration.",
+    )
+    candidates = [retrieval_metric]
+    if config.enable_live_models:
+        candidates.append(hybrid_metric)
+    final_metric = max(candidates, key=lambda metric: metric.exact_match_accuracy)
+    final_predictions = hybrid_predictions if final_metric.name == "hybrid" else retrieval_predictions
 
     avg_images = sum(len(row["image_paths"].split(";")) for row in sample_rows) / max(1, len(sample_rows))
     ops = build_operational_notes(reviewer, total_rows=len(sample_rows), avg_images_per_row=avg_images)
-    write_markdown_report(repo_root / args.report, [baseline_metric, final_metric], fallback_or_hybrid, ops)
+    metrics = [baseline_metric, retrieval_metric]
+    if config.enable_live_models:
+        metrics.append(hybrid_metric)
+    write_markdown_report(repo_root / args.report, metrics, final_metric.name, ops)
     write_html_report(
         repo_root / args.html,
         repo_root=repo_root,
@@ -70,9 +84,14 @@ def main() -> int:
         predicted_rows=[prediction.values for prediction in final_predictions],
     )
     write_csv_rows(
-        repo_root / "code" / "evaluation" / f"{fallback_or_hybrid}_sample_predictions.csv",
+        repo_root / "code" / "evaluation" / f"{final_metric.name}_sample_predictions.csv",
         [prediction.values for prediction in final_predictions],
     )
+    if config.enable_live_models:
+        write_csv_rows(
+            repo_root / "code" / "evaluation" / "hybrid_sample_predictions.csv",
+            [prediction.values for prediction in hybrid_predictions],
+        )
     print(f"Report written to {repo_root / args.report}")
     print(f"HTML explorer written to {repo_root / args.html}")
     return 0

@@ -189,6 +189,6 @@ DEFAULT_SEVERITY_BY_ISSUE = {
 }
 
 MODEL_DEFAULTS = {
-    "nim": "meta/llama-3.2-90b-vision-instruct",
+    "nim": "google/gemma-4-31b-it",
     "openrouter": "qwen/qwen2.5-vl-72b-instruct",
 }

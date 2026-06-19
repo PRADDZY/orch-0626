@@ -5,7 +5,8 @@
 | Strategy | Exact Row Accuracy | Notes |
 |---|---:|---|
 | text_baseline | 20.00% | Transcript parsing with image quality checks only. |
-| retrieval | 30.00% | Live multimodal review when keys are present, otherwise retrieval plus rule arbitration. |
+| retrieval | 30.00% | Offline retrieval plus rule arbitration. |
+| hybrid | 20.00% | Live per-image multimodal review plus claim aggregation when keys are present, otherwise retrieval plus rule arbitration. |
 
 Selected final strategy: `retrieval`
 
@@ -24,10 +25,10 @@ Selected final strategy: `retrieval`
 
 ## Operational Analysis
 
-- Approximate model calls for full processing: `0`
-- Approximate input token usage: `0`
-- Approximate output token usage: `0`
-- Number of images processed during this run: `58`
-- Cost assumption: Live provider keys were not available in the local environment, so the offline retrieval fallback was executed at zero API cost.
-- Latency/runtime note: Live mode performs one row-level multimodal review per claim and reuses file-backed caches on repeated runs.
-- TPM/RPM note: The pipeline is sequential by default, cache-aware, and can be batched later if provider RPM limits become visible during a live run.
+- Approximate model calls for full processing: `20`
+- Approximate input token usage: `18000`
+- Approximate output token usage: `5000`
+- Number of images processed during this run: `87`
+- Cost assumption: NVIDIA Build developer endpoint assumed to be free during hackathon development; OpenRouter fallback cost not incurred unless explicitly enabled.
+- Latency/runtime note: Live mode performs one claim-normalization call, one image-review call per image, and one text-only aggregation call per row. Oversized images are compressed for inline transport and retried with provider/model fallbacks when needed.
+- TPM/RPM note: The pipeline is sequential by default, cache-aware, and retries across current NIM-compatible multimodal models before dropping to the offline retrieval fallback.

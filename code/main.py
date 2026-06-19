@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategy",
         choices=["hybrid", "retrieval", "text_baseline"],
-        default="hybrid",
+        default="retrieval",
         help="Prediction strategy to run.",
     )
     return parser
