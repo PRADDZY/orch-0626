@@ -1,6 +1,9 @@
 name: Final Output
 
 on:
+  push:
+    branches:
+      - submission-pass-2
   workflow_dispatch:
 
 jobs:
