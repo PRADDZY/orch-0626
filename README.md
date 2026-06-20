@@ -8,7 +8,7 @@ The final submission strategy is a retrieval-first ensemble:
 - a live multimodal path can normalize claims and review images
 - the ensemble promotes live outputs only when they are cleaner or better grounded than retrieval
 
-On the organizer sample set included in this repo, the checked-in evaluation currently selects `ensemble` as the best strategy with `35.00%` exact row accuracy versus `30.00%` for pure retrieval.
+On the organizer sample set included in this repo, the latest checked-in fresh evaluation selects `ensemble` as the best strategy with `60.00%` exact row accuracy versus `50.00%` for pure retrieval.
 
 ## Solution Summary
 
@@ -39,12 +39,12 @@ Current sample benchmark in `code/evaluation/evaluation_report.md`:
 
 | Strategy | Exact Row Accuracy |
 |---|---:|
-| `text_baseline` | 20.00% |
-| `retrieval` | 30.00% |
-| `hybrid` | 30.00% |
-| `ensemble` | 35.00% |
+| `text_baseline` | 25.00% |
+| `retrieval` | 50.00% |
+| `hybrid` | 20.00% |
+| `ensemble` | 60.00% |
 
-Best exact-match gains from the ensemble come from using cached live multimodal evidence when it is more precise than the fallback, while avoiding unstable live outputs when they conflict with cleaner retrieval decisions.
+The current checked-in report is based on the fresh `PROMPT_VERSION=live-rerun-20260620b` benchmark path, where the ensemble keeps retrieval as a floor and only promotes live outputs when they are cleaner or better grounded than the deterministic fallback.
 
 ## Run Locally
 
@@ -71,7 +71,7 @@ Important environment variables:
 - `NVIDIA_API_KEY` for the NVIDIA live path
 - `OPENROUTER_API_KEY` for optional OpenRouter fallback
 - `PROMPT_VERSION`
-  Default is `v8` so the checked-in cache-backed live benchmark remains reproducible locally. Increase it when you want to force a fresh live rerun.
+  Default is `v8` so the cache-backed benchmark remains reproducible locally. Increase it when you want to force a fresh live rerun such as `live-rerun-20260620b`.
 
 ## Output Artifacts
 
@@ -89,5 +89,12 @@ Important environment variables:
 - the evaluation workflow compares more than two strategies as required
 - the repo includes a project-specific README, runnable code, cached live artifacts, and benchmark outputs
 - no secrets are committed in the repository
+- the latest fresh benchmark report is `code/evaluation/evaluation_report.md`
+
+Final submission checklist:
+
+- `submission/code.zip`
+- `submission/output.csv`
+- `%USERPROFILE%\\hackerrank_orchestrate\\log.txt` as the chat transcript artifact referenced by `AGENTS.md`
 
 Chat transcript logging still follows the organizer instructions in `AGENTS.md`. Submit the generated `log.txt` from the configured path alongside `code.zip` and `output.csv`.

@@ -61,6 +61,13 @@ python code/evaluation/main.py
 
 This compares the text baseline, retrieval fallback, live hybrid path, and the gated ensemble strategy, then writes the markdown report plus the static HTML explorer.
 
+Latest checked-in fresh benchmark snapshot in `code/evaluation/evaluation_report.md`:
+
+- `text_baseline`: `25.00%`
+- `retrieval`: `50.00%`
+- `hybrid`: `20.00%`
+- `ensemble`: `60.00%`
+
 ## Notes
 
 - `code/.cache/` stores file-backed caches for live normalization, per-image review responses, and claim-level aggregation results.
